@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -114,17 +115,25 @@ func main() {
 
 // connectDB DBに接続する
 func connectDB(batch bool) (*sqlx.DB, error) {
-	dsn := fmt.Sprintf(
-		"%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=true&loc=%s&multiStatements=%t",
-		getEnv("ISUCON_DB_USER", "isucon"),
-		getEnv("ISUCON_DB_PASSWORD", "isucon"),
-		getEnv("ISUCON_DB_HOST", "127.0.0.1"),
-		getEnv("ISUCON_DB_PORT", "3306"),
-		getEnv("ISUCON_DB_NAME", "isucon"),
-		"Asia%2FTokyo",
-		batch,
-	)
-	dbx, err := sqlx.Open("mysql", dsn)
+	loc, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := mysql.NewConfig()
+	cfg.User = getEnv("ISUCON_DB_USER", "isucon")
+	cfg.Passwd = getEnv("ISUCON_DB_PASSWORD", "isucon")
+	cfg.Net = "tcp"
+	cfg.Addr = net.JoinHostPort(getEnv("ISUCON_DB_HOST", "127.0.0.1"), getEnv("ISUCON_DB_PORT", "3306"))
+	cfg.DBName = getEnv("ISUCON_DB_NAME", "isucon")
+	cfg.ParseTime = true
+	cfg.Loc = loc
+	cfg.MultiStatements = batch
+	if err := cfg.Apply(mysql.Charset("utf8mb4", "")); err != nil {
+		return nil, err
+	}
+
+	dbx, err := sqlx.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return nil, err
 	}
