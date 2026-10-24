@@ -4,11 +4,12 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/csv"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
-	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -16,89 +17,101 @@ import (
 // admin
 
 // adminSessionCheckMiddleware 管理者ツール向けのセッション確認middleware
-func (h *Handler) adminSessionCheckMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
-	return func(c echo.Context) error {
-		sessID := c.Request().Header.Get("x-session")
+func (h *Handler) adminSessionCheckMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sessID := r.Header.Get("x-session")
 
 		adminSession := new(Session)
 		query := "SELECT * FROM admin_sessions WHERE session_id=? AND deleted_at IS NULL"
 		if err := h.DB.Get(adminSession, query, sessID); err != nil {
-			if err == sql.ErrNoRows {
-				return errorResponse(c, http.StatusUnauthorized, ErrUnauthorized)
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusUnauthorized, ErrUnauthorized)
+				return
 			}
-			return errorResponse(c, http.StatusInternalServerError, err)
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 
-		requestAt, err := getRequestTime(c)
+		requestAt, err := getRequestTime(r)
 		if err != nil {
-			return errorResponse(c, http.StatusInternalServerError, ErrGetRequestTime)
+			writeError(w, http.StatusInternalServerError, ErrGetRequestTime)
+			return
 		}
 
 		if adminSession.ExpiredAt < requestAt {
 			query = "UPDATE admin_sessions SET deleted_at=? WHERE session_id=?"
 			if _, err = h.DB.Exec(query, requestAt, sessID); err != nil {
-				return errorResponse(c, http.StatusInternalServerError, err)
+				writeError(w, http.StatusInternalServerError, err)
+				return
 			}
-			return errorResponse(c, http.StatusUnauthorized, ErrExpiredSession)
+			writeError(w, http.StatusUnauthorized, ErrExpiredSession)
+			return
 		}
 
-		if err := next(c); err != nil {
-			c.Error(err)
-		}
-		return nil
-	}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // adminLogin 管理者権限ログイン
 // POST /admin/login
-func (h *Handler) adminLogin(c echo.Context) error {
-	defer c.Request().Body.Close()
+func (h *Handler) adminLogin(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
 	req := new(AdminLoginRequest)
-	if err := parseRequestBody(c, req); err != nil {
-		return errorResponse(c, http.StatusBadRequest, err)
+	if err := parseRequestBody(r, req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
 	}
 
-	requestAt, err := getRequestTime(c)
+	requestAt, err := getRequestTime(r)
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, ErrGetRequestTime)
+		writeError(w, http.StatusInternalServerError, ErrGetRequestTime)
+		return
 	}
 
 	tx, err := h.DB.Beginx()
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	defer tx.Rollback() //nolint:errcheck
 
 	query := "SELECT * FROM admin_users WHERE id=?"
 	user := new(AdminUser)
 	if err = tx.Get(user, query, req.UserID); err != nil {
-		if err == sql.ErrNoRows {
-			return errorResponse(c, http.StatusNotFound, ErrUserNotFound)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, ErrUserNotFound)
+			return
 		}
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	if err = verifyPassword(user.Password, req.Password); err != nil {
-		return errorResponse(c, http.StatusUnauthorized, err)
+		writeError(w, http.StatusUnauthorized, err)
+		return
 	}
 
 	query = "UPDATE admin_users SET last_activated_at=?, updated_at=? WHERE id=?"
 	if _, err = tx.Exec(query, requestAt, requestAt, req.UserID); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	query = "UPDATE admin_sessions SET deleted_at=? WHERE user_id=? AND deleted_at IS NULL"
 	if _, err = tx.Exec(query, requestAt, req.UserID); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	sID, err := h.generateID()
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	sessID, err := generateUUID()
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	sess := &Session{
 		ID:        sID,
@@ -111,15 +124,17 @@ func (h *Handler) adminLogin(c echo.Context) error {
 
 	query = "INSERT INTO admin_sessions(id, user_id, session_id, created_at, updated_at, expired_at) VALUES (?, ?, ?, ?, ?, ?)"
 	if _, err = tx.Exec(query, sess.ID, sess.UserID, sess.SessionID, sess.CreatedAt, sess.UpdatedAt, sess.ExpiredAt); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	err = tx.Commit()
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
-	return successResponse(c, &AdminLoginResponse{
+	writeJSON(w, http.StatusOK, &AdminLoginResponse{
 		AdminSession: sess,
 	})
 }
@@ -135,63 +150,72 @@ type AdminLoginResponse struct {
 
 // adminLogout 管理者権限ログアウト
 // DELETE /admin/logout
-func (h *Handler) adminLogout(c echo.Context) error {
-	sessID := c.Request().Header.Get("x-session")
+func (h *Handler) adminLogout(w http.ResponseWriter, r *http.Request) {
+	sessID := r.Header.Get("x-session")
 
-	requestAt, err := getRequestTime(c)
+	requestAt, err := getRequestTime(r)
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, ErrGetRequestTime)
+		writeError(w, http.StatusInternalServerError, ErrGetRequestTime)
+		return
 	}
 
 	query := "UPDATE admin_sessions SET deleted_at=? WHERE session_id=? AND deleted_at IS NULL"
 	if _, err = h.DB.Exec(query, requestAt, sessID); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
-	return noContentResponse(c, http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // adminListMaster マスタデータ閲覧
 // GET /admin/master
-func (h *Handler) adminListMaster(c echo.Context) error {
+func (h *Handler) adminListMaster(w http.ResponseWriter, r *http.Request) {
 	masterVersions := make([]*VersionMaster, 0)
 	if err := h.DB.Select(&masterVersions, "SELECT * FROM version_masters"); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	items := make([]*ItemMaster, 0)
 	if err := h.DB.Select(&items, "SELECT * FROM item_masters"); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	gachas := make([]*GachaMaster, 0)
 	if err := h.DB.Select(&gachas, "SELECT * FROM gacha_masters"); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	gachaItems := make([]*GachaItemMaster, 0)
 	if err := h.DB.Select(&gachaItems, "SELECT * FROM gacha_item_masters"); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	presentAlls := make([]*PresentAllMaster, 0)
 	if err := h.DB.Select(&presentAlls, "SELECT * FROM present_all_masters"); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 
 	}
 
 	loginBonuses := make([]*LoginBonusMaster, 0)
 	if err := h.DB.Select(&loginBonuses, "SELECT * FROM login_bonus_masters"); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 
 	}
 
 	loginBonusRewards := make([]*LoginBonusRewardMaster, 0)
 	if err := h.DB.Select(&loginBonusRewards, "SELECT * FROM login_bonus_reward_masters"); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
-	return successResponse(c, &AdminListMasterResponse{
+	writeJSON(w, http.StatusOK, &AdminListMasterResponse{
 		VersionMaster:     masterVersions,
 		Items:             items,
 		Gachas:            gachas,
@@ -214,18 +238,27 @@ type AdminListMasterResponse struct {
 
 // adminUpdateMaster マスタデータ更新
 // PUT /admin/master
-func (h *Handler) adminUpdateMaster(c echo.Context) error {
+func (h *Handler) adminUpdateMaster(w http.ResponseWriter, r *http.Request) {
+	// chiはコピーしたリクエストを渡すため、net/httpはこのリクエストの一時ファイルを削除しない
+	defer func() {
+		if r.MultipartForm != nil {
+			r.MultipartForm.RemoveAll() //nolint:errcheck
+		}
+	}()
+
 	tx, err := h.DB.Beginx()
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	defer tx.Rollback() //nolint:errcheck
 
 	// version master
-	versionMasterRecs, err := readFormFileToCSV(c, "versionMaster")
+	versionMasterRecs, err := readFormFileToCSV(r, "versionMaster")
 	if err != nil {
-		if err != ErrNoFormFile {
-			return errorResponse(c, http.StatusBadRequest, err)
+		if !errors.Is(err, ErrNoFormFile) {
+			writeError(w, http.StatusBadRequest, err)
+			return
 		}
 	}
 	if versionMasterRecs != nil {
@@ -243,17 +276,19 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 
 		query := "INSERT INTO version_masters(id, status, master_version) VALUES (:id, :status, :master_version) ON DUPLICATE KEY UPDATE status=VALUES(status), master_version=VALUES(master_version)"
 		if _, err = tx.NamedExec(query, data); err != nil {
-			return errorResponse(c, http.StatusInternalServerError, err)
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 	} else {
-		c.Logger().Debug("Skip Update Master: versionMaster")
+		slog.Debug("Skip Update Master: versionMaster")
 	}
 
 	// item
-	itemMasterRecs, err := readFormFileToCSV(c, "itemMaster")
+	itemMasterRecs, err := readFormFileToCSV(r, "itemMaster")
 	if err != nil {
-		if err != ErrNoFormFile {
-			return errorResponse(c, http.StatusBadRequest, err)
+		if !errors.Is(err, ErrNoFormFile) {
+			writeError(w, http.StatusBadRequest, err)
+			return
 		}
 	}
 	if itemMasterRecs != nil {
@@ -282,17 +317,19 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 			"ON DUPLICATE KEY UPDATE item_type=VALUES(item_type), name=VALUES(name), description=VALUES(description), amount_per_sec=VALUES(amount_per_sec), max_level=VALUES(max_level), max_amount_per_sec=VALUES(max_amount_per_sec), base_exp_per_level=VALUES(base_exp_per_level), gained_exp=VALUES(gained_exp), shortening_min=VALUES(shortening_min)",
 		}, " ")
 		if _, err = tx.NamedExec(query, data); err != nil {
-			return errorResponse(c, http.StatusInternalServerError, err)
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 	} else {
-		c.Logger().Debug("Skip Update Master: itemMaster")
+		slog.Debug("Skip Update Master: itemMaster")
 	}
 
 	// gacha
-	gachaRecs, err := readFormFileToCSV(c, "gachaMaster")
+	gachaRecs, err := readFormFileToCSV(r, "gachaMaster")
 	if err != nil {
-		if err != ErrNoFormFile {
-			return errorResponse(c, http.StatusBadRequest, err)
+		if !errors.Is(err, ErrNoFormFile) {
+			writeError(w, http.StatusBadRequest, err)
+			return
 		}
 	}
 	if gachaRecs != nil {
@@ -317,17 +354,19 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 			"ON DUPLICATE KEY UPDATE name=VALUES(name), start_at=VALUES(start_at), end_at=VALUES(end_at), display_order=VALUES(display_order), created_at=VALUES(created_at)",
 		}, " ")
 		if _, err = tx.NamedExec(query, data); err != nil {
-			return errorResponse(c, http.StatusInternalServerError, err)
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 	} else {
-		c.Logger().Debug("Skip Update Master: gachaMaster")
+		slog.Debug("Skip Update Master: gachaMaster")
 	}
 
 	// gacha item
-	gachaItemRecs, err := readFormFileToCSV(c, "gachaItemMaster")
+	gachaItemRecs, err := readFormFileToCSV(r, "gachaItemMaster")
 	if err != nil {
-		if err != ErrNoFormFile {
-			return errorResponse(c, http.StatusBadRequest, err)
+		if !errors.Is(err, ErrNoFormFile) {
+			writeError(w, http.StatusBadRequest, err)
+			return
 		}
 	}
 	if gachaItemRecs != nil {
@@ -353,17 +392,19 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 			"ON DUPLICATE KEY UPDATE gacha_id=VALUES(gacha_id), item_type=VALUES(item_type), item_id=VALUES(item_id), amount=VALUES(amount), weight=VALUES(weight), created_at=VALUES(created_at)",
 		}, " ")
 		if _, err = tx.NamedExec(query, data); err != nil {
-			return errorResponse(c, http.StatusInternalServerError, err)
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 	} else {
-		c.Logger().Debug("Skip Update Master: gachaItemMaster")
+		slog.Debug("Skip Update Master: gachaItemMaster")
 	}
 
 	// present all
-	presentAllRecs, err := readFormFileToCSV(c, "presentAllMaster")
+	presentAllRecs, err := readFormFileToCSV(r, "presentAllMaster")
 	if err != nil {
-		if err != ErrNoFormFile {
-			return errorResponse(c, http.StatusBadRequest, err)
+		if !errors.Is(err, ErrNoFormFile) {
+			writeError(w, http.StatusBadRequest, err)
+			return
 		}
 	}
 	if presentAllRecs != nil {
@@ -390,17 +431,19 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 			"ON DUPLICATE KEY UPDATE registered_start_at=VALUES(registered_start_at), registered_end_at=VALUES(registered_end_at), item_type=VALUES(item_type), item_id=VALUES(item_id), amount=VALUES(amount), present_message=VALUES(present_message), created_at=VALUES(created_at)",
 		}, " ")
 		if _, err = tx.NamedExec(query, data); err != nil {
-			return errorResponse(c, http.StatusInternalServerError, err)
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 	} else {
-		c.Logger().Debug("Skip Update Master: presentAllMaster")
+		slog.Debug("Skip Update Master: presentAllMaster")
 	}
 
 	// login bonuses
-	loginBonusRecs, err := readFormFileToCSV(c, "loginBonusMaster")
+	loginBonusRecs, err := readFormFileToCSV(r, "loginBonusMaster")
 	if err != nil {
-		if err != ErrNoFormFile {
-			return errorResponse(c, http.StatusBadRequest, err)
+		if !errors.Is(err, ErrNoFormFile) {
+			writeError(w, http.StatusBadRequest, err)
+			return
 		}
 	}
 	if loginBonusRecs != nil {
@@ -429,17 +472,19 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 			"ON DUPLICATE KEY UPDATE start_at=VALUES(start_at), end_at=VALUES(end_at), column_count=VALUES(column_count), looped=VALUES(looped), created_at=VALUES(created_at)",
 		}, " ")
 		if _, err = tx.NamedExec(query, data); err != nil {
-			return errorResponse(c, http.StatusInternalServerError, err)
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 	} else {
-		c.Logger().Debug("Skip Update Master: loginBonusMaster")
+		slog.Debug("Skip Update Master: loginBonusMaster")
 	}
 
 	// login bonus rewards
-	loginBonusRewardRecs, err := readFormFileToCSV(c, "loginBonusRewardMaster")
+	loginBonusRewardRecs, err := readFormFileToCSV(r, "loginBonusRewardMaster")
 	if err != nil {
-		if err != ErrNoFormFile {
-			return errorResponse(c, http.StatusBadRequest, err)
+		if !errors.Is(err, ErrNoFormFile) {
+			writeError(w, http.StatusBadRequest, err)
+			return
 		}
 	}
 	if loginBonusRewardRecs != nil {
@@ -465,23 +510,26 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 			"ON DUPLICATE KEY UPDATE login_bonus_id=VALUES(login_bonus_id), reward_sequence=VALUES(reward_sequence), item_type=VALUES(item_type), item_id=VALUES(item_id), amount=VALUES(amount), created_at=VALUES(created_at)",
 		}, " ")
 		if _, err = tx.NamedExec(query, data); err != nil {
-			return errorResponse(c, http.StatusInternalServerError, err)
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 	} else {
-		c.Logger().Debug("Skip Update Master: loginBonusRewardMaster")
+		slog.Debug("Skip Update Master: loginBonusRewardMaster")
 	}
 
 	activeMaster := new(VersionMaster)
 	if err = tx.Get(activeMaster, "SELECT * FROM version_masters WHERE status=1"); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	err = tx.Commit()
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
-	return successResponse(c, &AdminUpdateMasterResponse{
+	writeJSON(w, http.StatusOK, &AdminUpdateMasterResponse{
 		VersionMaster: activeMaster,
 	})
 }
@@ -491,15 +539,10 @@ type AdminUpdateMasterResponse struct {
 }
 
 // readFromFileToCSV ファイルからcsvレコードを取得する
-func readFormFileToCSV(c echo.Context, name string) ([][]string, error) {
-	file, err := c.FormFile(name)
+func readFormFileToCSV(r *http.Request, name string) ([][]string, error) {
+	src, _, err := r.FormFile(name)
 	if err != nil {
 		return nil, ErrNoFormFile
-	}
-
-	src, err := file.Open()
-	if err != nil {
-		return nil, err
 	}
 	defer src.Close()
 
@@ -519,64 +562,74 @@ func readFormFileToCSV(c echo.Context, name string) ([][]string, error) {
 
 // adminUser ユーザの詳細画面
 // GET /admin/user/{userID}
-func (h *Handler) adminUser(c echo.Context) error {
-	userID, err := getUserID(c)
+func (h *Handler) adminUser(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserID(r)
 	if err != nil {
-		return errorResponse(c, http.StatusBadRequest, err)
+		writeError(w, http.StatusBadRequest, err)
+		return
 	}
 
 	query := "SELECT * FROM users WHERE id=?"
 	user := new(User)
 	if err = h.DB.Get(user, query, userID); err != nil {
-		if err == sql.ErrNoRows {
-			return errorResponse(c, http.StatusNotFound, ErrUserNotFound)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, ErrUserNotFound)
+			return
 		}
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	query = "SELECT * FROM user_devices WHERE user_id=?"
 	devices := make([]*UserDevice, 0)
 	if err = h.DB.Select(&devices, query, userID); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	query = "SELECT * FROM user_cards WHERE user_id=?"
 	cards := make([]*UserCard, 0)
 	if err = h.DB.Select(&cards, query, userID); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	query = "SELECT * FROM user_decks WHERE user_id=?"
 	decks := make([]*UserDeck, 0)
 	if err = h.DB.Select(&decks, query, userID); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	query = "SELECT * FROM user_items WHERE user_id=?"
 	items := make([]*UserItem, 0)
 	if err = h.DB.Select(&items, query, userID); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	query = "SELECT * FROM user_login_bonuses WHERE user_id=?"
 	loginBonuses := make([]*UserLoginBonus, 0)
 	if err = h.DB.Select(&loginBonuses, query, userID); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	query = "SELECT * FROM user_presents WHERE user_id=?"
 	presents := make([]*UserPresent, 0)
 	if err = h.DB.Select(&presents, query, userID); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	query = "SELECT * FROM user_present_all_received_history WHERE user_id=?"
 	presentHistory := make([]*UserPresentAllReceivedHistory, 0)
 	if err = h.DB.Select(&presentHistory, query, userID); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
-	return successResponse(c, &AdminUserResponse{
+	writeJSON(w, http.StatusOK, &AdminUserResponse{
 		User:                          user,
 		UserDevices:                   devices,
 		UserCards:                     cards,
@@ -602,36 +655,42 @@ type AdminUserResponse struct {
 
 // adminBanUser ユーザBAN処理
 // POST /admin/user/{userId}/ban
-func (h *Handler) adminBanUser(c echo.Context) error {
-	userID, err := getUserID(c)
+func (h *Handler) adminBanUser(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserID(r)
 	if err != nil {
-		return errorResponse(c, http.StatusBadRequest, err)
+		writeError(w, http.StatusBadRequest, err)
+		return
 	}
 
-	requestAt, err := getRequestTime(c)
+	requestAt, err := getRequestTime(r)
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, ErrGetRequestTime)
+		writeError(w, http.StatusInternalServerError, ErrGetRequestTime)
+		return
 	}
 
 	query := "SELECT * FROM users WHERE id=?"
 	user := new(User)
 	if err = h.DB.Get(user, query, userID); err != nil {
-		if err == sql.ErrNoRows {
-			return errorResponse(c, http.StatusBadRequest, ErrUserNotFound)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, ErrUserNotFound)
+			return
 		}
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	banID, err := h.generateID()
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	query = "INSERT user_bans(id, user_id, created_at, updated_at) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE updated_at = ?"
 	if _, err = h.DB.Exec(query, banID, userID, requestAt, requestAt, requestAt); err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
-	return successResponse(c, &AdminBanUserResponse{
+	writeJSON(w, http.StatusOK, &AdminBanUserResponse{
 		User: user,
 	})
 }
@@ -641,6 +700,7 @@ type AdminBanUserResponse struct {
 }
 
 // hashPassword パスワードをハッシュ化する
+//
 //nolint:deadcode,unused
 func hashPassword(pw string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
